@@ -23,10 +23,14 @@ namespace SlimeImuProtocol.SlimeProtocol {
             get => _batteryLevel;
             set
             {
+                // Debounce: only send when level changes more than 1% (0.01 absolute) or
+                // voltage changes more than 0.05V. Avoids packet spam from callers that
+                // update battery every frame.
+                if (MathF.Abs(value - _batteryLevel) < 0.01f) return;
                 _batteryLevel = value;
                 if (_ready)
                 {
-                    _udpHandler.SetSensorBattery(_batteryLevel, BatteryVoltage);
+                    _ = _udpHandler.SetSensorBattery(_batteryLevel, BatteryVoltage);
                 }
             }
         }
@@ -67,15 +71,17 @@ namespace SlimeImuProtocol.SlimeProtocol {
             MagStatus = magStatus;
 
             var token = _cts.Token;
+            // Await firmware availability with a 60s ceiling. Still polls since the source
+            // (external TrackerDevice) doesn't expose a FirmwareReady event — but uses
+            // Task.Delay (non-blocking) and respects cancellation so Dispose can unstick it.
             Task.Run(async () => {
-                // Bounded wait: 60 s ceiling so a device that never publishes firmware cannot
-                // keep this task (and its UDPHandler construction) pinned forever.
                 const int maxWaitMs = 60000;
+                const int pollMs = 250;
                 int elapsed = 0;
                 while (device.FirmwareVersion == null) {
                     if (token.IsCancellationRequested) return;
-                    try { await Task.Delay(250, token); } catch (OperationCanceledException) { return; }
-                    elapsed += 250;
+                    try { await Task.Delay(pollMs, token); } catch (OperationCanceledException) { return; }
+                    elapsed += pollMs;
                     if (elapsed >= maxWaitMs) return;
                 }
                 if (token.IsCancellationRequested) return;
