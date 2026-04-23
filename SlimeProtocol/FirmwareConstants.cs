@@ -156,47 +156,64 @@ namespace SlimeImuProtocol.SlimeVR
             RIGHT_LITTLE_INTERMEDIATE = 49,
             RIGHT_LITTLE_DISTAL = 50
         }
-        public class UDPPackets
+        /// <summary>
+        /// Packet IDs sent tracker → SlimeVR server (outgoing).
+        /// </summary>
+        public static class UDPPackets
         {
-            public static int HEARTBEAT = 0;
-            public static int ROTATION = 1;
-            public static int GYRO = 2;
-            public static int HANDSHAKE = 3;
-            public static int ACCELERATION = 4;
-            public static int MAG = 5;
-            public static int RAW_CALIBRATION_DATA = 6;
-            public static int CALIBRATION_FINISHED = 7;
-            public static int CONFIG = 8;
-            public static int RAW_MAGENTOMETER = 9;
-            public static int PING_PONG = 10;
-            public static int SERIAL = 11;
-            public static int BATTERY_LEVEL = 12;
-            public static int TAP = 13;
-            public static int RESET_REASON = 14;
-            public static int SENSOR_INFO = 15;
-            public static int ROTATION_2 = 16;
-            public static int ROTATION_DATA = 17;
-            public static int MAGENTOMETER_ACCURACY = 18;
+            public const int HEARTBEAT = 0;
+            public const int ROTATION = 1;
+            public const int GYRO = 2;
+            public const int HANDSHAKE = 3;
+            public const int ACCELERATION = 4;
+            public const int MAG = 5;
+            public const int RAW_CALIBRATION_DATA = 6;
+            public const int CALIBRATION_FINISHED = 7;
+            public const int CONFIG = 8;
+            public const int RAW_MAGNETOMETER = 9;
+            public const int PING_PONG = 10;
+            public const int SERIAL = 11;
+            public const int BATTERY_LEVEL = 12;
+            public const int TAP = 13;
+            public const int RESET_REASON = 14;
+            public const int SENSOR_INFO = 15;
+            public const int ROTATION_2 = 16;
+            public const int ROTATION_DATA = 17;
+            public const int MAGNETOMETER_ACCURACY = 18;
+            public const int CALIBRATION_ACTION = 21;
+            public const int FLEX_DATA_PACKET = 26;
+            public const int HAPTICS = 30;
+            public const int BUTTON_PUSHED = 60;
+            public const int SEND_MAG_STATUS = 61;
+            public const int CHANGE_MAG_STATUS = 62;
+            public const int FEATURE_FLAGS = 22;
+            public const int CONTROLLER_BUTTON = 66;
+            public const int THUMBSTICK = 67;
+            public const int TRIGGER = 68;
+            public const int GRIP = 69;
+            public const int BUNDLE = 100;
 
-            public static int CALIBRATION_ACTION = 21;
+            /// <summary>Feature flag bit indices (little-endian bit array).</summary>
+            public static class FeatureFlagBits
+            {
+                public const int PROTOCOL_BUNDLE_SUPPORT = 0;
+            }
 
-            public static int FLEX_DATA_PACKET = 26;
-            public static int BUTTON_PUSHED = 60;
-            public static int SEND_MAG_STATUS = 61;
-            public static int CHANGE_MAG_STATUS = 62;
+            // Deprecated typo aliases — will be removed in a future version.
+            [Obsolete("Use RAW_MAGNETOMETER")] public const int RAW_MAGENTOMETER = RAW_MAGNETOMETER;
+            [Obsolete("Use MAGNETOMETER_ACCURACY")] public const int MAGENTOMETER_ACCURACY = MAGNETOMETER_ACCURACY;
+        }
 
-            public static int HAPTICS = 30;
-
-            public static int RECIEVE_HEARTBEAT = 1;
-            public static int RECIEVE_VIBRATE = 2;
-            public static int RECIEVE_HANDSHAKE = 3;
-            public static int RECIEVE_COMMAND = 4;
-            public static int BUNDLE = 100;
-
-            public static int CONTROLLER_BUTTON = 66;
-            public static int THUMBSTICK = 67;
-            public static int TRIGGER = 68;
-            public static int GRIP = 69;
+        /// <summary>
+        /// Packet IDs received from SlimeVR server (incoming). Values can collide with
+        /// outgoing packet IDs — the direction disambiguates them.
+        /// </summary>
+        public static class UDPPacketsIn
+        {
+            public const int RECEIVE_HEARTBEAT = 1;
+            public const int RECEIVE_VIBRATE = 2;
+            public const int RECEIVE_HANDSHAKE = 3;
+            public const int RECEIVE_COMMAND = 4;
         }
 
     }
