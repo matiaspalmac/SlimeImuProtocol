@@ -22,7 +22,7 @@ namespace SlimeImuProtocol.SlimeVR
         private readonly byte[] _flexDataBuffer = new byte[4 + 8 + 1 + 4];
         private readonly byte[] _buttonBuffer = new byte[4 + 8 + 1];
         private readonly byte[] _batteryBuffer = new byte[4 + 8 + 4 + 4];
-        private readonly byte[] _hapticBuffer = new byte[4 + 3 + 4 + 4 + 1];
+        private readonly byte[] _hapticBuffer = new byte[4 + 8 + 4 + 4 + 1];
         private readonly byte[] _controllerButtonBuffer = new byte[4 + 8 + 1 + 1];
         private readonly byte[] _triggerAnalogueBuffer = new byte[4 + 8 + 4 + 1];
         private readonly byte[] _gripAnalogueBuffer = new byte[4 + 8 + 4 + 1];
@@ -73,9 +73,9 @@ namespace SlimeImuProtocol.SlimeVR
             w.SetPosition(0);
             w.WriteInt32((int)UDPPackets.ACCELERATION); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
-            w.WriteSingle(acceleration.X); // Euler X
-            w.WriteSingle(acceleration.Y); // Euler Y
-            w.WriteSingle(acceleration.Z); // Euler Z
+            w.WriteSingle(acceleration.X); // Accel X (m/s²)
+            w.WriteSingle(acceleration.Y); // Accel Y
+            w.WriteSingle(acceleration.Z); // Accel Z
             w.WriteByte(trackerId); // Tracker id
             return _accelerationBuffer.AsMemory(0, w.Position);
         }
@@ -113,9 +113,9 @@ namespace SlimeImuProtocol.SlimeVR
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteByte(trackerId); // Tracker id
             w.WriteByte(1); // Data type 
-            w.WriteSingle(gyro.X); // Euler X
-            w.WriteSingle(gyro.Y); // Euler Y
-            w.WriteSingle(gyro.Z); // Euler Z
+            w.WriteSingle(gyro.X); // Gyro X (rad/s)
+            w.WriteSingle(gyro.Y); // Gyro Y
+            w.WriteSingle(gyro.Z); // Gyro Z
             w.WriteByte(0); // Calibration Info
             return _gyroBuffer.AsMemory(0, w.Position);
         }
@@ -128,9 +128,9 @@ namespace SlimeImuProtocol.SlimeVR
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteByte(trackerId); // Tracker id
             w.WriteByte(1); // Data type 
-            w.WriteSingle(m.X); // Euler X
-            w.WriteSingle(m.Y); // Euler Y
-            w.WriteSingle(m.Z); // Euler Z
+            w.WriteSingle(m.X); // Mag X (µT)
+            w.WriteSingle(m.Y); // Mag Y
+            w.WriteSingle(m.Z); // Mag Z
             w.WriteByte(0); // Calibration Info
             return _magnetometerBuffer.AsMemory(0, w.Position);
         }
