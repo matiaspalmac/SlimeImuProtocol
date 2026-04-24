@@ -46,9 +46,15 @@ namespace SlimeImuProtocol.SlimeVR
         // absence of recent send failures.
         private long _packetsSent;
         private long _sendFailures;
+        // Set from the server's FEATURE_FLAGS reply. Gates use of BUNDLE (type 100). Default
+        // false until the reply lands — otherwise first packets would silently drop on a
+        // server that doesn't advertise PROTOCOL_BUNDLE_SUPPORT. Volatile so the send hot
+        // path reads the latest value without a lock.
+        private volatile bool _serverSupportsBundle;
         public long PacketsSent => System.Threading.Interlocked.Read(ref _packetsSent);
         public long SendFailures => System.Threading.Interlocked.Read(ref _sendFailures);
         public bool ServerReachable => _isInitialized;
+        public bool ServerSupportsBundle => _serverSupportsBundle;
 
         /// <summary>
         /// Unified send path. Counts success/failure so UI diagnostics don't lie. Callers use
@@ -191,7 +197,7 @@ namespace SlimeImuProtocol.SlimeVR
                         Debug.WriteLine($"[UDPHandler] Handshake Success for {_id}. Sending sensor info...");
                         for (int i = 0; i < _supportedSensorCount; i++)
                         {
-                            await SendInternal(packetBuilder.BuildSensorInfoPacket(imuType, TrackerPosition.NONE, TrackerDataType.ROTATION, (byte)i));
+                            await SendInternal(packetBuilder.BuildSensorInfoPacket(imuType, TrackerPosition.NONE, TrackerDataType.ROTATION, (byte)i, magnetometerStatus));
                         }
 
                         // Advertise supported protocol features so the server knows it can use
@@ -281,6 +287,20 @@ namespace SlimeImuProtocol.SlimeVR
                     else if (packetType == UDPPacketsIn.RECEIVE_HEARTBEAT)
                     {
                         await SendInternal(packetBuilder.CreateHeartBeat());
+                    }
+                    else if (packetType == UDPPackets.FEATURE_FLAGS)
+                    {
+                        // Server reply layout: header(4) + packetId(8) + flagBytes(variable).
+                        // Bit 0 of first flag byte = PROTOCOL_BUNDLE_SUPPORT (LSB0 order, matches
+                        // our outbound BuildFeatureFlagsPacket). Gate SetSensorBundle on this;
+                        // without the reply, bundle is disabled by default to avoid silent drops.
+                        if (buffer.Length >= 13)
+                        {
+                            byte flagByte0 = buffer[12];
+                            bool bundleBit = (flagByte0 & (1 << UDPPackets.FeatureFlagBits.PROTOCOL_BUNDLE_SUPPORT)) != 0;
+                            _serverSupportsBundle = bundleBit;
+                            Debug.WriteLine($"[UDPHandler] Server FEATURE_FLAGS: bundle={bundleBit}");
+                        }
                     }
                 }
                 catch (Exception ex) when (!disposed)
@@ -465,16 +485,26 @@ namespace SlimeImuProtocol.SlimeVR
         }
 
         /// <summary>
-        /// Hot-path convenience: builds ROTATION_DATA + ACCELERATION in one BUNDLE. Saves one
-        /// syscall per IMU sample vs SetSensorRotation + SetSensorAcceleration called
-        /// separately. At 200 Hz × N trackers this halves outbound datagrams.
+        /// Hot-path convenience: builds ROTATION_DATA + ACCELERATION in one BUNDLE when the
+        /// server has advertised PROTOCOL_BUNDLE_SUPPORT via FEATURE_FLAGS. Falls back to two
+        /// separate sends when the flag isn't set — the server silently drops type-100
+        /// packets it doesn't recognise, so we can't unconditionally bundle. ServerSupportsBundle
+        /// flips true once the server's FEATURE_FLAGS reply reaches ReceiveLoop.
         /// </summary>
         public async Task<bool> SetSensorBundle(Quaternion rotation, Vector3 acceleration, byte trackerId)
         {
             if (udpClient == null || !_isInitialized) return true;
             var rot = packetBuilder.BuildRotationPacket(rotation, trackerId);
             var acc = packetBuilder.BuildAccelerationPacket(acceleration, trackerId);
-            await SendInternal(packetBuilder.BuildBundlePacket(rot, acc));
+            if (_serverSupportsBundle)
+            {
+                await SendInternal(packetBuilder.BuildBundlePacket(rot, acc));
+            }
+            else
+            {
+                await SendInternal(acc);
+                await SendInternal(rot);
+            }
             _lastQuaternion = rotation;
             _lastAccelerationPacket = acceleration;
             return true;

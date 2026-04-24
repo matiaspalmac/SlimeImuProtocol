@@ -220,19 +220,40 @@ namespace SlimeImuProtocol.SlimeVR
             return span;
         }
 
-        public byte[] BuildSensorInfoPacket(ImuType imuType, TrackerPosition pos, TrackerDataType dataType, byte trackerId)
+        /// <summary>
+        /// SENSOR_INFO (type 15). Layout per SlimeVR-Server UDPPacket15SensorInfo.readData:
+        ///   [header(4)][packetId(8)][sensorId byte][sensorStatus byte][sensorType byte]
+        ///   [sensorConfig uint16 BE][hasCompletedRestCalibration byte][trackerPosition byte]
+        ///   [trackerDataType byte]
+        /// SensorConfig bit packing:
+        ///   bit 0 = magnetometer enable (1=on), bit 1 = magnetometer supported (1=present).
+        ///   ENABLED=0x03, DISABLED=0x02, NOT_SUPPORTED=0x00.
+        /// Previous version omitted sensorConfig + hasCompletedRestCalibration and wrote a
+        /// hardcoded "calibration state" int16 in their place, which the server parsed as
+        /// sensorConfig=1 → bit 1 unset → NOT_SUPPORTED regardless of what we passed in the
+        /// handshake's magStatus field (the server doesn't read mag from the handshake, only
+        /// from this packet).
+        /// </summary>
+        public byte[] BuildSensorInfoPacket(ImuType imuType, TrackerPosition pos, TrackerDataType dataType, byte trackerId, MagnetometerStatus magStatus = MagnetometerStatus.NOT_SUPPORTED)
         {
-            var span = new byte[4 + 8 + 1 + 1 + 1 + 2 + 1 + 1];
+            ushort sensorConfig = magStatus switch
+            {
+                MagnetometerStatus.ENABLED => 0x0003,        // bit 1 + bit 0
+                MagnetometerStatus.DISABLED => 0x0002,       // bit 1 only
+                _ => 0x0000,                                 // NOT_SUPPORTED
+            };
+            var span = new byte[4 + 8 + 1 + 1 + 1 + 2 + 1 + 1 + 1];
             var w = new BigEndianWriter(span);
             w.SetPosition(0);
-            w.WriteInt32((int)UDPPackets.SENSOR_INFO); // Packet header
-            w.WriteInt64(NextPacketId()); // Packet counter
-            w.WriteByte(trackerId); // Tracker Id
-            w.WriteByte(0); // Sensor status
-            w.WriteByte((byte)imuType);  // IMU type
-            w.WriteInt16(1); // Calibration state
-            w.WriteByte((byte)pos);  // Tracker Position
-            w.WriteByte((byte)dataType);  // Tracker Data Type
+            w.WriteInt32((int)UDPPackets.SENSOR_INFO);
+            w.WriteInt64(NextPacketId());
+            w.WriteByte(trackerId);
+            w.WriteByte(0);                      // sensor status (0 = OK)
+            w.WriteByte((byte)imuType);
+            w.WriteInt16((short)sensorConfig);   // sensorConfig bitmask — carries magStatus
+            w.WriteByte(0);                      // hasCompletedRestCalibration (0 = not yet)
+            w.WriteByte((byte)pos);
+            w.WriteByte((byte)dataType);
             return span;
         }
 
@@ -311,14 +332,19 @@ namespace SlimeImuProtocol.SlimeVR
         }
 
         /// <summary>
-        /// BUNDLE packet (type 100). Wraps N inner packets in one datagram, each prefixed with
-        /// uint16 length. Requires server to advertise PROTOCOL_BUNDLE_SUPPORT via FEATURE_FLAGS.
-        /// Saves syscall + UDP header overhead at high send rates (e.g. rotation+accel+battery).
+        /// BUNDLE packet (type 100). Layout per SlimeVR-Server UDPProtocolParser.kt:
+        ///   outer: [int32 BE type=100][int64 BE packetNumber]
+        ///   repeated inner: [uint16 BE length][int32 BE innerType][innerPayload]
+        /// The outer has a packet number (consumed by parse() before the BUNDLE branch), but
+        /// each inner packet is header(type)+payload ONLY — no inner packet number. Our
+        /// standalone Build*Packet helpers include an 8-byte packet id right after the type,
+        /// which is correct for single-datagram sends but must be stripped when embedded in
+        /// a bundle. Strip bytes [4..12] of each inner before copying.
         /// </summary>
         public byte[] BuildBundlePacket(params ReadOnlyMemory<byte>[] innerPackets)
         {
-            int total = 4 + 8; // bundle header + packet id
-            foreach (var p in innerPackets) total += 2 + p.Length; // uint16 length + payload
+            int total = 4 + 8; // bundle type + outer packet number
+            foreach (var p in innerPackets) total += 2 + (p.Length - 8); // length + (packet minus inner packet-id)
 
             var buf = new byte[total];
             var w = new BigEndianWriter(buf);
@@ -327,9 +353,14 @@ namespace SlimeImuProtocol.SlimeVR
             w.WriteInt64(NextPacketId());
             foreach (var p in innerPackets)
             {
-                w.WriteInt16((short)p.Length);
-                p.Span.CopyTo(buf.AsSpan(w.Position));
-                w.Skip(p.Length);
+                int innerLen = p.Length - 8; // drop the 8-byte packet id from the inner
+                w.WriteInt16((short)innerLen);
+                // type (first 4 bytes)
+                p.Span.Slice(0, 4).CopyTo(buf.AsSpan(w.Position));
+                w.Skip(4);
+                // payload (everything after the 12-byte type+id prefix)
+                p.Span.Slice(12).CopyTo(buf.AsSpan(w.Position));
+                w.Skip(p.Length - 12);
             }
             return buf;
         }
