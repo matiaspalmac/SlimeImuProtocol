@@ -25,6 +25,10 @@ namespace SlimeImuProtocol.SlimeVR
         private PacketBuilder packetBuilder;
         private int slimevrPort = 6969;
         UdpClient udpClient;
+        // Protects the udpClient reference during Configure/Dispose swaps. Reads take the lock
+        // briefly to snapshot the reference, then operate on the snapshot — prevents
+        // ObjectDisposedException races when Configure runs while a Send is in flight.
+        private readonly object _udpClientLock = new object();
         int handshakeCount = 1000;
         bool _active = true;
         private bool disposed;
@@ -52,9 +56,13 @@ namespace SlimeImuProtocol.SlimeVR
         /// </summary>
         private async Task SendInternal(ReadOnlyMemory<byte> payload)
         {
+            if (disposed) return;
+            UdpClient client;
+            lock (_udpClientLock) { client = udpClient; }
+            if (client == null) return;
             try
             {
-                await udpClient.SendAsync(payload);
+                await client.SendAsync(payload);
                 System.Threading.Interlocked.Increment(ref _packetsSent);
             }
             catch
@@ -65,9 +73,13 @@ namespace SlimeImuProtocol.SlimeVR
 
         private async Task SendInternal(byte[] payload)
         {
+            if (disposed) return;
+            UdpClient client;
+            lock (_udpClientLock) { client = udpClient; }
+            if (client == null) return;
             try
             {
-                await udpClient.SendAsync(payload, payload.Length);
+                await client.SendAsync(payload, payload.Length);
                 System.Threading.Interlocked.Increment(ref _packetsSent);
             }
             catch
@@ -224,9 +236,16 @@ namespace SlimeImuProtocol.SlimeVR
         {
             while (!disposed)
             {
+                UdpClient client;
+                lock (_udpClientLock) { client = udpClient; }
+                if (client == null)
+                {
+                    await Task.Delay(100);
+                    continue;
+                }
                 try
                 {
-                    var result = await udpClient.ReceiveAsync();
+                    var result = await client.ReceiveAsync();
                     _lastPacketReceivedTime = DateTimeOffset.UtcNow.ToUniversalTime().ToUnixTimeMilliseconds();
 
                     byte[] buffer = result.Buffer;
@@ -247,7 +266,8 @@ namespace SlimeImuProtocol.SlimeVR
                     if (looksLikeHandshakeAscii && !_isInitialized)
                     {
                         _endpoint = result.RemoteEndPoint.Address.ToString();
-                        udpClient.Connect(_endpoint, 6969);
+                        // Pin the outbound socket to the responding server.
+                        lock (_udpClientLock) { udpClient?.Connect(_endpoint, 6969); }
                         _isInitialized = true;
                         Debug.WriteLine($"[UDPHandler] Got Discovery Response for {_id}: {_endpoint}");
                         OnServerDiscovered?.Invoke(null, _endpoint);
@@ -285,21 +305,30 @@ namespace SlimeImuProtocol.SlimeVR
 
         public void ConfigureUdp()
         {
+            UdpClient oldClient;
+            UdpClient newClient = null;
+            lock (_udpClientLock)
+            {
+                oldClient = udpClient;
+                udpClient = null; // readers take this as "no client available" until new one in place
+            }
             try
             {
-                if (udpClient != null)
-                {
-                    udpClient?.Close();
-                    udpClient?.Dispose();
-                }
                 _endpoint = Endpoint; // Cache the current static endpoint locally
-                udpClient = new UdpClient();
-                udpClient.Connect(_endpoint, 6969);
+                newClient = new UdpClient();
+                newClient.Connect(_endpoint, 6969);
+                lock (_udpClientLock) { udpClient = newClient; }
                 Debug.WriteLine($"[UDPHandler] Configured UDP for {_id} -> {_endpoint}");
             }
             catch (Exception ex)
             {
+                try { newClient?.Dispose(); } catch { }
                 Debug.WriteLine($"[UDPHandler] ConfigureUdp error for {_id}: {ex.Message}");
+            }
+            finally
+            {
+                try { oldClient?.Close(); } catch { }
+                try { oldClient?.Dispose(); } catch { }
             }
         }
 
@@ -444,9 +473,10 @@ namespace SlimeImuProtocol.SlimeVR
                     disposed = true;
                     _isInitialized = false;
                     System.Threading.Interlocked.Exchange(ref _handshakeOngoingFlag, 0);
-                    udpClient?.Close();
-                    udpClient?.Dispose();
-                    udpClient = null;
+                    UdpClient c;
+                    lock (_udpClientLock) { c = udpClient; udpClient = null; }
+                    try { c?.Close(); } catch { }
+                    try { c?.Dispose(); } catch { }
                 }
             }
             catch { }

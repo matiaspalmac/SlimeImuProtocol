@@ -12,22 +12,26 @@ namespace SlimeImuProtocol.SlimeVR
         private int _protocolVersion = 19;
         private long _packetId;
 
-        // Pre-allocated buffers for reuse
-        private readonly byte[] _rotationBuffer = new byte[4 + 8 + 1 + 1 + 16 + 1];
-        private readonly byte[] _accelerationBuffer = new byte[4 + 8 + 12 + 1];
-        private readonly byte[] _analogueStickBuffer = new byte[4 + 8 + 12 + 1];
-        private readonly byte[] _analogueTouchpadBuffer = new byte[4 + 8 + 12 + 1];
-        private readonly byte[] _gyroBuffer = new byte[4 + 8 + 1 + 1 + 12 + 1];
-        private readonly byte[] _magnetometerBuffer = new byte[4 + 8 + 1 + 1 + 12 + 1];
-        private readonly byte[] _flexDataBuffer = new byte[4 + 8 + 1 + 4];
-        private readonly byte[] _buttonBuffer = new byte[4 + 8 + 1];
-        private readonly byte[] _batteryBuffer = new byte[4 + 8 + 4 + 4];
-        private readonly byte[] _hapticBuffer = new byte[4 + 8 + 4 + 4 + 1];
-        private readonly byte[] _controllerButtonBuffer = new byte[4 + 8 + 1 + 1];
-        private readonly byte[] _triggerAnalogueBuffer = new byte[4 + 8 + 4 + 1];
-        private readonly byte[] _gripAnalogueBuffer = new byte[4 + 8 + 4 + 1];
-
-        private byte[] _heartBeat = new byte[4 + 8 + 1];
+        // Per-packet sizes — allocated fresh on every Build* call. Previous version reused
+        // instance-field buffers, which corrupted silently when two Tasks (e.g. the JSL
+        // rotation callback and a concurrent accel send) built packets in parallel before
+        // the first one had been sent. Fresh allocations trade ~90 B/packet garbage for
+        // correctness. ArrayPool<byte>.Shared.Rent/Return is the optimization path if the
+        // allocation rate ever shows up in profiling.
+        private const int RotationBufferSize       = 4 + 8 + 1 + 1 + 16 + 1;
+        private const int AccelerationBufferSize   = 4 + 8 + 12 + 1;
+        private const int StickBufferSize          = 4 + 8 + 12 + 1;
+        private const int TouchpadBufferSize       = 4 + 8 + 12 + 1;
+        private const int GyroBufferSize           = 4 + 8 + 1 + 1 + 12 + 1;
+        private const int MagnetometerBufferSize   = 4 + 8 + 1 + 1 + 12 + 1;
+        private const int FlexDataBufferSize       = 4 + 8 + 1 + 4;
+        private const int ButtonBufferSize         = 4 + 8 + 1;
+        private const int BatteryBufferSize        = 4 + 8 + 4 + 4;
+        private const int HapticBufferSize         = 4 + 8 + 4 + 4 + 1;
+        private const int ControllerButtonSize     = 4 + 8 + 1 + 1;
+        private const int TriggerAnalogueSize      = 4 + 8 + 4 + 1;
+        private const int GripAnalogueSize         = 4 + 8 + 4 + 1;
+        private const int HeartbeatBufferSize      = 4 + 8 + 1;
 
         public PacketBuilder(string fwString)
         {
@@ -43,18 +47,18 @@ namespace SlimeImuProtocol.SlimeVR
 
         public ReadOnlyMemory<byte> CreateHeartBeat()
         {
-            var w = new BigEndianWriter(_heartBeat);
-            w.SetPosition(0);
+            var buf = new byte[HeartbeatBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.HEARTBEAT); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteByte(0); // Tracker Id
-            return _heartBeat.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildRotationPacket(Quaternion rotation, byte trackerId)
         {
-            var w = new BigEndianWriter(_rotationBuffer);
-            w.SetPosition(0);
+            var buf = new byte[RotationBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.ROTATION_DATA); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteByte(trackerId); // Tracker id
@@ -64,96 +68,96 @@ namespace SlimeImuProtocol.SlimeVR
             w.WriteSingle(rotation.Z); // Quaternion Z
             w.WriteSingle(rotation.W); // Quaternion W
             w.WriteByte(0); // Calibration Info
-            return _rotationBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildAccelerationPacket(Vector3 acceleration, byte trackerId)
         {
-            var w = new BigEndianWriter(_accelerationBuffer);
-            w.SetPosition(0);
+            var buf = new byte[AccelerationBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.ACCELERATION); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteSingle(acceleration.X); // Accel X (m/s²)
             w.WriteSingle(acceleration.Y); // Accel Y
             w.WriteSingle(acceleration.Z); // Accel Z
             w.WriteByte(trackerId); // Tracker id
-            return _accelerationBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
         public ReadOnlyMemory<byte> BuildThumbstickPacket(Vector2 _analogueStick, byte trackerId)
         {
-            var w = new BigEndianWriter(_analogueStickBuffer);
-            w.SetPosition(0);
+            var buf = new byte[StickBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.THUMBSTICK); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteSingle(_analogueStick.X); // Analogue X
             w.WriteSingle(_analogueStick.Y); // Analogue Y
             w.WriteSingle(0); // Analogue Z (Unused)
             w.WriteByte(trackerId); // Tracker id
-            return _analogueStickBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildTouchpadPacket(Vector2 _analogueTouchpad, byte trackerId)
         {
-            var w = new BigEndianWriter(_analogueTouchpadBuffer);
-            w.SetPosition(0);
+            var buf = new byte[TouchpadBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.THUMBSTICK); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteSingle(_analogueTouchpad.X); // Analogue X
             w.WriteSingle(_analogueTouchpad.Y); // Analogue Y
             w.WriteSingle(0); // Analogue Z (Unused)
             w.WriteByte(trackerId); // Tracker id
-            return _analogueTouchpadBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildGyroPacket(Vector3 gyro, byte trackerId)
         {
-            var w = new BigEndianWriter(_gyroBuffer);
-            w.SetPosition(0);
+            var buf = new byte[GyroBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.GYRO); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteByte(trackerId); // Tracker id
-            w.WriteByte(1); // Data type 
+            w.WriteByte(1); // Data type
             w.WriteSingle(gyro.X); // Gyro X (rad/s)
             w.WriteSingle(gyro.Y); // Gyro Y
             w.WriteSingle(gyro.Z); // Gyro Z
             w.WriteByte(0); // Calibration Info
-            return _gyroBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildMagnetometerPacket(Vector3 m, byte trackerId)
         {
-            var w = new BigEndianWriter(_magnetometerBuffer);
-            w.SetPosition(0);
+            var buf = new byte[MagnetometerBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.MAG); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteByte(trackerId); // Tracker id
-            w.WriteByte(1); // Data type 
+            w.WriteByte(1); // Data type
             w.WriteSingle(m.X); // Mag X (µT)
             w.WriteSingle(m.Y); // Mag Y
             w.WriteSingle(m.Z); // Mag Z
             w.WriteByte(0); // Calibration Info
-            return _magnetometerBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildFlexDataPacket(float flex, byte trackerId)
         {
-            var w = new BigEndianWriter(_flexDataBuffer);
-            w.SetPosition(0);
+            var buf = new byte[FlexDataBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.FLEX_DATA_PACKET); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteByte(trackerId); // Tracker id
             w.WriteSingle(flex); // Flex data
-            return _flexDataBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildButtonPushedPacket(UserActionType action)
         {
-            var w = new BigEndianWriter(_buttonBuffer);
-            w.SetPosition(0);
+            var buf = new byte[ButtonBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.CALIBRATION_ACTION); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteByte((byte)action); // Action type
-            return _buttonBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         /// <summary>
@@ -164,25 +168,25 @@ namespace SlimeImuProtocol.SlimeVR
         /// <param name="voltageVolts">Battery voltage in volts (e.g. 3.7). Pass a sane default if unknown — zero hides the indicator in SlimeVR UI.</param>
         public ReadOnlyMemory<byte> BuildBatteryLevelPacket(float batteryPercent, float voltageVolts)
         {
-            var w = new BigEndianWriter(_batteryBuffer);
-            w.SetPosition(0);
+            var buf = new byte[BatteryBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.BATTERY_LEVEL);
             w.WriteInt64(NextPacketId());
             w.WriteSingle(voltageVolts <= 0.1f ? 3.7f : voltageVolts);
             w.WriteSingle(Math.Clamp(batteryPercent / 100f, 0f, 1f));
-            return _batteryBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildHapticPacket(float intensity, int duration)
         {
-            var w = new BigEndianWriter(_hapticBuffer);
-            w.SetPosition(0);
+            var buf = new byte[HapticBufferSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.HAPTICS); // full-width header like every other packet
             w.WriteInt64(NextPacketId());
             w.WriteSingle(intensity);
             w.WriteInt32(duration);
             w.WriteByte(1); // active
-            return _hapticBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public byte[] BuildHandshakePacket(BoardType boardType, ImuType imuType, McuType mcuType, MagnetometerStatus magStatus, byte[] mac)
@@ -234,35 +238,35 @@ namespace SlimeImuProtocol.SlimeVR
 
         public ReadOnlyMemory<byte> BuildControllerButtonPushedPacket(ControllerButton action, byte trackerId)
         {
-            var w = new BigEndianWriter(_controllerButtonBuffer);
-            w.SetPosition(0);
+            var buf = new byte[ControllerButtonSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.CONTROLLER_BUTTON); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
             w.WriteByte((byte)action); // Action type
             w.WriteByte(trackerId); // Tracker id
-            return _controllerButtonBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildTriggerAnaloguePacket(float triggerAnalogue, byte trackerId)
         {
-            var w = new BigEndianWriter(_triggerAnalogueBuffer);
-            w.SetPosition(0);
+            var buf = new byte[TriggerAnalogueSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.TRIGGER); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
-            w.WriteSingle(triggerAnalogue); // Euler X
+            w.WriteSingle(triggerAnalogue); // Trigger value 0..1
             w.WriteByte(trackerId); // Tracker id
-            return _triggerAnalogueBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         public ReadOnlyMemory<byte> BuildGripAnaloguePacket(float gripAnalogue, byte trackerId)
         {
-            var w = new BigEndianWriter(_gripAnalogueBuffer);
-            w.SetPosition(0);
+            var buf = new byte[GripAnalogueSize];
+            var w = new BigEndianWriter(buf);
             w.WriteInt32((int)UDPPackets.GRIP); // Header
             w.WriteInt64(NextPacketId()); // Packet counter
-            w.WriteSingle(gripAnalogue); // Euler X
+            w.WriteSingle(gripAnalogue); // Grip value 0..1
             w.WriteByte(trackerId); // Tracker id
-            return _gripAnalogueBuffer.AsMemory(0, w.Position);
+            return buf.AsMemory(0, w.Position);
         }
 
         /// <summary>
