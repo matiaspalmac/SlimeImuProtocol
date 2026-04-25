@@ -51,10 +51,30 @@ namespace SlimeImuProtocol.SlimeVR
         // server that doesn't advertise PROTOCOL_BUNDLE_SUPPORT. Volatile so the send hot
         // path reads the latest value without a lock.
         private volatile bool _serverSupportsBundle;
+        // bit 1 of server flags. Gates BUNDLE_COMPACT (pkt 101 + Q15/Q7 frames). Half-bandwidth
+        // path; only enabled once both this flag is true and the user opts in via configuration.
+        private volatile bool _serverSupportsBundleCompact;
         public long PacketsSent => System.Threading.Interlocked.Read(ref _packetsSent);
         public long SendFailures => System.Threading.Interlocked.Read(ref _sendFailures);
         public bool ServerReachable => _isInitialized;
         public bool ServerSupportsBundle => _serverSupportsBundle;
+        public bool ServerSupportsBundleCompact => _serverSupportsBundleCompact;
+
+        /// <summary>
+        /// Opt-in flag for using BUNDLE_COMPACT (pkt 101) when the server advertises support.
+        /// Off by default because it's a new wire path — flipping to true on a misconfigured
+        /// server would silently drop trackers. Recommended to enable globally only after a
+        /// full test cycle. When false, falls back to BUNDLE (pkt 100) or two-packet sends.
+        /// </summary>
+        public static bool BundleCompactEnabled { get; set; } = false;
+
+        /// <summary>
+        /// Server-issued SET_CONFIG_FLAG (pkt 25) request. Tracker classes can subscribe to
+        /// honour the request — for example, toggle the magnetometer enable on a JC2. The
+        /// handler is invoked AFTER UDPHandler has already ACKed the request to the server,
+        /// so listeners only need to apply the local-side change.
+        /// </summary>
+        public event EventHandler<ConfigFlagRequest> OnConfigFlagRequested;
 
         /// <summary>
         /// Unified send path. Counts success/failure so UI diagnostics don't lie. Callers use
@@ -205,7 +225,14 @@ namespace SlimeImuProtocol.SlimeVR
                         // single-packet-per-datagram mode even if we send bundles ourselves.
                         try
                         {
-                            await SendInternal(packetBuilder.BuildFeatureFlagsPacket(UDPPackets.FeatureFlagBits.PROTOCOL_BUNDLE_SUPPORT));
+                            // Advertise tracker-side capabilities. Bit 2 = SENSOR_CONFIG so the
+                            // server knows it can issue SET_CONFIG_FLAG (pkt 25) — for example
+                            // to toggle the magnetometer remotely. We do NOT advertise
+                            // REMOTE_COMMAND or B64_WIFI_SCANNING since the bridge can't honour
+                            // those. Previous code mistakenly sent server-namespace bit 0; both
+                            // were ignored by the server but the new value is correct.
+                            await SendInternal(packetBuilder.BuildFeatureFlagsPacket(
+                                UDPPackets.FirmwareFeatureFlagBits.SENSOR_CONFIG));
                         }
                         catch (Exception ex) { Debug.WriteLine($"[UDPHandler] FeatureFlags send failed: {ex.Message}"); }
 
@@ -291,15 +318,39 @@ namespace SlimeImuProtocol.SlimeVR
                     else if (packetType == UDPPackets.FEATURE_FLAGS)
                     {
                         // Server reply layout: header(4) + packetId(8) + flagBytes(variable).
-                        // Bit 0 of first flag byte = PROTOCOL_BUNDLE_SUPPORT (LSB0 order, matches
-                        // our outbound BuildFeatureFlagsPacket). Gate SetSensorBundle on this;
-                        // without the reply, bundle is disabled by default to avoid silent drops.
+                        // Bits use the SERVER namespace (ServerFeatureFlagBits) — distinct
+                        // from the FirmwareFeatureFlagBits we advertise outbound. Bit 0 =
+                        // PROTOCOL_BUNDLE_SUPPORT, bit 1 = PROTOCOL_BUNDLE_COMPACT_SUPPORT.
+                        // Without the reply, bundle is disabled by default to avoid silent drops.
                         if (buffer.Length >= 13)
                         {
                             byte flagByte0 = buffer[12];
-                            bool bundleBit = (flagByte0 & (1 << UDPPackets.FeatureFlagBits.PROTOCOL_BUNDLE_SUPPORT)) != 0;
+                            bool bundleBit = (flagByte0 & (1 << UDPPackets.ServerFeatureFlagBits.PROTOCOL_BUNDLE_SUPPORT)) != 0;
+                            bool bundleCompactBit = (flagByte0 & (1 << UDPPackets.ServerFeatureFlagBits.PROTOCOL_BUNDLE_COMPACT_SUPPORT)) != 0;
                             _serverSupportsBundle = bundleBit;
-                            Debug.WriteLine($"[UDPHandler] Server FEATURE_FLAGS: bundle={bundleBit}");
+                            _serverSupportsBundleCompact = bundleCompactBit;
+                            Debug.WriteLine($"[UDPHandler] Server FEATURE_FLAGS: bundle={bundleBit} bundleCompact={bundleCompactBit}");
+                        }
+                    }
+                    else if (packetType == UDPPackets.SET_CONFIG_FLAG)
+                    {
+                        // Server→tracker remote config toggle. Layout after header(4)+packetId(8):
+                        //   sensorId   (1 byte)
+                        //   configType (2 bytes BE u16)
+                        //   state      (1 byte 0/1)
+                        // We accept the packet, log it, and ACK so the server's pending change
+                        // doesn't time out. Actual application of the config (e.g. mag enable)
+                        // is per-source business logic — surfaced via OnConfigFlagRequested.
+                        if (buffer.Length >= 16)
+                        {
+                            byte sensorId = buffer[12];
+                            ushort configType = (ushort)((buffer[13] << 8) | buffer[14]);
+                            bool state = buffer[15] != 0;
+                            Debug.WriteLine($"[UDPHandler] SET_CONFIG_FLAG sensor={sensorId} type={configType} state={state}");
+                            try { OnConfigFlagRequested?.Invoke(this, new ConfigFlagRequest(sensorId, configType, state)); }
+                            catch (Exception evEx) { Debug.WriteLine($"[UDPHandler] OnConfigFlagRequested handler threw: {evEx.Message}"); }
+                            try { await SendInternal(packetBuilder.BuildAckConfigChangePacket(sensorId, configType)); }
+                            catch (Exception ackEx) { Debug.WriteLine($"[UDPHandler] ACK_CONFIG_CHANGE send failed: {ackEx.Message}"); }
                         }
                     }
                 }
@@ -494,6 +545,19 @@ namespace SlimeImuProtocol.SlimeVR
         public async Task<bool> SetSensorBundle(Quaternion rotation, Vector3 acceleration, byte trackerId)
         {
             if (udpClient == null || !_isInitialized) return true;
+
+            // Tier 1: BUNDLE_COMPACT (pkt 101 + pkt 23 Q15/Q7). Halves bandwidth; gated on
+            // both server advertisement AND opt-in static flag because it's a new wire path.
+            if (BundleCompactEnabled && _serverSupportsBundleCompact)
+            {
+                var inner = packetBuilder.BuildRotationAccelCompactInner(rotation, acceleration, trackerId);
+                await SendInternal(packetBuilder.BuildBundleCompactPacket(
+                    ((byte)UDPPackets.ROTATION_AND_ACCELERATION_COMPACT, inner)));
+                _lastQuaternion = rotation;
+                _lastAccelerationPacket = acceleration;
+                return true;
+            }
+
             var rot = packetBuilder.BuildRotationPacket(rotation, trackerId);
             var acc = packetBuilder.BuildAccelerationPacket(acceleration, trackerId);
             if (_serverSupportsBundle)
@@ -502,8 +566,11 @@ namespace SlimeImuProtocol.SlimeVR
             }
             else
             {
-                await SendInternal(acc);
+                // Send rotation first so the server has a frame to apply the accel sample
+                // against. Reversed order produced visible 1-frame jitter on legacy servers
+                // because the accel packet was attached to the previous rotation.
                 await SendInternal(rot);
+                await SendInternal(acc);
             }
             _lastQuaternion = rotation;
             _lastAccelerationPacket = acceleration;
@@ -542,6 +609,24 @@ namespace SlimeImuProtocol.SlimeVR
             {
                 _ = SendInternal(packetBuilder.BuildGripAnaloguePacket(grip, trackerId));
             }
+        }
+    }
+
+    /// <summary>
+    /// Carries SET_CONFIG_FLAG (pkt 25) request data from <see cref="UDPHandler.OnConfigFlagRequested"/>.
+    /// <c>ConfigType</c> identifies which config flag the server wants to toggle (e.g. mag enable);
+    /// the exact id↔meaning mapping is managed in SlimeVR-Server's <c>ConfigTypeId</c> registry.
+    /// </summary>
+    public sealed class ConfigFlagRequest : EventArgs
+    {
+        public byte SensorId { get; }
+        public ushort ConfigType { get; }
+        public bool State { get; }
+        public ConfigFlagRequest(byte sensorId, ushort configType, bool state)
+        {
+            SensorId = sensorId;
+            ConfigType = configType;
+            State = state;
         }
     }
 }

@@ -189,13 +189,47 @@ namespace SlimeImuProtocol.SlimeVR
             public const int SEND_MAG_STATUS = 61;
             public const int CHANGE_MAG_STATUS = 62;
             public const int FEATURE_FLAGS = 22;
+            public const int ROTATION_AND_ACCELERATION_COMPACT = 23;
+            public const int ACK_CONFIG_CHANGE = 24;
+            public const int SET_CONFIG_FLAG = 25;
             public const int CONTROLLER_BUTTON = 66;
             public const int THUMBSTICK = 67;
             public const int TRIGGER = 68;
             public const int GRIP = 69;
             public const int BUNDLE = 100;
+            public const int BUNDLE_COMPACT = 101;
 
-            /// <summary>Feature flag bit indices (little-endian bit array).</summary>
+            /// <summary>
+            /// Server→tracker capability bits, advertised when the server sends pkt 22 to us.
+            /// Read these from the inbound packet to gate which compact / bundle features we
+            /// can use back. Indices match SlimeVR-Server's <c>ServerFeatureFlags</c> enum.
+            /// </summary>
+            public static class ServerFeatureFlagBits
+            {
+                public const int PROTOCOL_BUNDLE_SUPPORT = 0;
+                public const int PROTOCOL_BUNDLE_COMPACT_SUPPORT = 1;
+            }
+
+            /// <summary>
+            /// Tracker→server capability bits, advertised when WE send pkt 22 to the server.
+            /// Different namespace from <see cref="ServerFeatureFlagBits"/>: pkt 22 is
+            /// bidirectional, but each side packs its own enum into the flag bytes.
+            /// Indices match SlimeVR-Server's <c>FirmwareFeatures.FirmwareFeatureFlags</c>.
+            /// </summary>
+            public static class FirmwareFeatureFlagBits
+            {
+                public const int REMOTE_COMMAND = 0;
+                public const int B64_WIFI_SCANNING = 1;
+                public const int SENSOR_CONFIG = 2;
+            }
+
+            /// <summary>
+            /// Deprecated: pre-existing alias that incorrectly mixed server / firmware
+            /// namespaces. Bit 0 here is <c>REMOTE_COMMAND</c> on the firmware side, NOT
+            /// <c>PROTOCOL_BUNDLE_SUPPORT</c> as the name suggested. Kept for source
+            /// compat; the only previous caller has been migrated to the correct flag set.
+            /// </summary>
+            [Obsolete("Use ServerFeatureFlagBits or FirmwareFeatureFlagBits explicitly. The constant here was misnamed — bit 0 is REMOTE_COMMAND in firmware namespace.")]
             public static class FeatureFlagBits
             {
                 public const int PROTOCOL_BUNDLE_SUPPORT = 0;

@@ -55,6 +55,13 @@ namespace SlimeImuProtocol.SlimeVR
             return buf.AsMemory(0, w.Position);
         }
 
+        /// <summary>
+        /// Build pkt 17 ROTATION_DATA. Wire layout matches SlimeVR-Server's
+        /// <c>UDPProtocolParser.parseRotationData</c>: quaternion is sent in
+        /// <b>(X, Y, Z, W)</b> order. <see cref="System.Numerics.Quaternion"/> stores W last
+        /// internally, so the four <c>WriteSingle</c> calls below preserve that ordering on
+        /// the wire.
+        /// </summary>
         public ReadOnlyMemory<byte> BuildRotationPacket(Quaternion rotation, byte trackerId)
         {
             var buf = new byte[RotationBufferSize];
@@ -291,9 +298,11 @@ namespace SlimeImuProtocol.SlimeVR
         }
 
         /// <summary>
-        /// FEATURE_FLAGS packet (type 22). Advertises tracker-side capabilities to the server.
-        /// Layout: header(4) + packetId(8) + flagBytes(variable, LSB0 bit order).
-        /// Bit 0 = PROTOCOL_BUNDLE_SUPPORT. Other bits reserved.
+        /// FEATURE_FLAGS packet (type 22). Advertises tracker-side capabilities to the
+        /// server. Layout: header(4) + packetId(8) + flagBytes(variable, LSB0 bit order).
+        /// Tracker-side bits live in <see cref="FirmwareConstants.UDPPackets.FirmwareFeatureFlagBits"/>
+        /// (REMOTE_COMMAND=0, B64_WIFI_SCANNING=1, SENSOR_CONFIG=2). Server-side bits read
+        /// from inbound pkt 22 use <see cref="FirmwareConstants.UDPPackets.ServerFeatureFlagBits"/>.
         /// </summary>
         public byte[] BuildFeatureFlagsPacket(params int[] enabledFlagBits)
         {
@@ -312,6 +321,24 @@ namespace SlimeImuProtocol.SlimeVR
                 int bitIdx = bit % 8;
                 buf[12 + byteIdx] |= (byte)(1 << bitIdx);
             }
+            return buf;
+        }
+
+        /// <summary>
+        /// ACK_CONFIG_CHANGE packet (type 24). Tracker→server response to a SET_CONFIG_FLAG
+        /// request. Echoes the sensorId + configType so the server can correlate the ack
+        /// with its own pending change. Server's <c>UDPPacket24AckConfigChange.readData</c>
+        /// reads sensorId (1B) + configType (2B BE u16).
+        /// </summary>
+        public byte[] BuildAckConfigChangePacket(byte sensorId, ushort configType)
+        {
+            var buf = new byte[4 + 8 + 1 + 2];
+            var w = new BigEndianWriter(buf);
+            w.SetPosition(0);
+            w.WriteInt32((int)UDPPackets.ACK_CONFIG_CHANGE);
+            w.WriteInt64(NextPacketId());
+            w.WriteByte(sensorId);
+            w.WriteInt16((short)configType);
             return buf;
         }
 
@@ -361,6 +388,67 @@ namespace SlimeImuProtocol.SlimeVR
                 // payload (everything after the 12-byte type+id prefix)
                 p.Span.Slice(12).CopyTo(buf.AsSpan(w.Position));
                 w.Skip(p.Length - 12);
+            }
+            return buf;
+        }
+
+        // Q15 quat scale: 1.0 unit  ↔ 0x7FFF; -1.0 ↔ 0x8000. Quaternions are unit so each
+        // component is bounded in [-1, 1] — perfect fit.
+        private const float Q15Scale = 32767f;
+        // Q7 accel scale: 1 unit ↔ 128 ticks. ±256 m/s² range covers any human movement.
+        private const float Q7Scale = 128f;
+
+        /// <summary>
+        /// Builds the 15-byte inner payload for pkt 23 (ROTATION_AND_ACCELERATION compact).
+        /// Layout (all big-endian): sensorId(1) + qX(2) + qY(2) + qZ(2) + qW(2) + aX(2) +
+        /// aY(2) + aZ(2). Quaternion components are encoded Q15, acceleration is Q7. Caller
+        /// composes one or more of these into a BUNDLE_COMPACT envelope.
+        /// </summary>
+        public ReadOnlyMemory<byte> BuildRotationAccelCompactInner(Quaternion rotation, Vector3 acceleration, byte trackerId)
+        {
+            var buf = new byte[15];
+            var w = new BigEndianWriter(buf);
+            w.WriteByte(trackerId);
+            w.WriteInt16(SaturatingShort(rotation.X * Q15Scale));
+            w.WriteInt16(SaturatingShort(rotation.Y * Q15Scale));
+            w.WriteInt16(SaturatingShort(rotation.Z * Q15Scale));
+            w.WriteInt16(SaturatingShort(rotation.W * Q15Scale));
+            w.WriteInt16(SaturatingShort(acceleration.X * Q7Scale));
+            w.WriteInt16(SaturatingShort(acceleration.Y * Q7Scale));
+            w.WriteInt16(SaturatingShort(acceleration.Z * Q7Scale));
+            return buf.AsMemory(0, w.Position);
+        }
+
+        private static short SaturatingShort(float v)
+        {
+            if (v >= short.MaxValue) return short.MaxValue;
+            if (v <= short.MinValue) return short.MinValue;
+            return (short)v;
+        }
+
+        /// <summary>
+        /// Builds a BUNDLE_COMPACT envelope (pkt 101) containing one or more compact frames.
+        /// Each inner is wrapped <c>length(1B) + packetId(1B) + payload</c>; the outer has
+        /// the standard <c>type(4) + packetId(8)</c> header. Length byte covers the inner
+        /// packetId + payload (i.e. payload.Length + 1).
+        /// </summary>
+        public byte[] BuildBundleCompactPacket(params (byte InnerPacketId, ReadOnlyMemory<byte> Payload)[] inners)
+        {
+            int total = 4 + 8;
+            foreach (var p in inners) total += 1 + 1 + p.Payload.Length;
+
+            var buf = new byte[total];
+            var w = new BigEndianWriter(buf);
+            w.WriteInt32((int)UDPPackets.BUNDLE_COMPACT);
+            w.WriteInt64(NextPacketId());
+            foreach (var p in inners)
+            {
+                int innerLen = 1 + p.Payload.Length;
+                if (innerLen > 255) throw new InvalidOperationException("BUNDLE_COMPACT inner exceeds 255 bytes (length is 1B).");
+                w.WriteByte((byte)innerLen);
+                w.WriteByte(p.InnerPacketId);
+                p.Payload.Span.CopyTo(buf.AsSpan(w.Position));
+                w.Skip(p.Payload.Length);
             }
             return buf;
         }
