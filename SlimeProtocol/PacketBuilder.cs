@@ -255,7 +255,12 @@ namespace SlimeImuProtocol.SlimeVR
             w.WriteInt32((int)UDPPackets.SENSOR_INFO);
             w.WriteInt64(NextPacketId());
             w.WriteByte(trackerId);
-            w.WriteByte(0);                      // sensor status (0 = OK)
+            // Sensor status: 1 = OK on the server side. Previously hardcoded to 0, which the
+            // server's TrackerStatus.getStatus(0) maps to DISCONNECTED — the server then
+            // briefly displayed every freshly-registered tracker as offline until the first
+            // ROTATION_DATA packet flipped its internal state. Sending 1 up front makes the
+            // status icon turn green immediately on registration.
+            w.WriteByte(1);
             w.WriteByte((byte)imuType);
             w.WriteInt16((short)sensorConfig);   // sensorConfig bitmask — carries magStatus
             w.WriteByte(0);                      // hasCompletedRestCalibration (0 = not yet)

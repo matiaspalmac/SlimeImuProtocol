@@ -10,7 +10,16 @@ namespace SlimeImuProtocol.SlimeVR
 {
     public class UDPHandler : IDisposable
     {
-        private static string _endpoint = "255.255.255.255";
+        // Configured discovery target — broadcast at boot, narrowed to the resolved server
+        // IP after handshake. Static because the user-visible "server endpoint" setting is
+        // global, but each handler also tracks its own resolved IP in _endpoint below so
+        // multiple trackers can route to different addresses without trampling each other.
+        private static string _configuredEndpoint = "255.255.255.255";
+        // Resolved IP for THIS handler's UdpClient. Was previously a static field shared
+        // across every UDPHandler instance, which meant the first handshake reply for any
+        // tracker clobbered the discovery target for all others — multi-tracker setups
+        // routinely lost packets after the second device connected.
+        private string _endpoint = _configuredEndpoint;
         // 0 = idle, 1 = handshake in progress. Serialized via Interlocked.CompareExchange to
         // prevent two handlers from racing into simultaneous discovery.
         private static int _handshakeOngoingFlag = 0;
@@ -115,7 +124,7 @@ namespace SlimeImuProtocol.SlimeVR
         }
 
         public bool Active { get => _active; set => _active = value; }
-        public static string Endpoint { get => _endpoint; set => _endpoint = value; }
+        public static string Endpoint { get => _configuredEndpoint; set => _configuredEndpoint = value; }
         public static bool HandshakeOngoing => System.Threading.Volatile.Read(ref _handshakeOngoingFlag) != 0;
 
         /// <summary>
@@ -299,8 +308,13 @@ namespace SlimeImuProtocol.SlimeVR
                     if (looksLikeHandshakeAscii && !_isInitialized)
                     {
                         _endpoint = result.RemoteEndPoint.Address.ToString();
-                        // Pin the outbound socket to the responding server.
-                        lock (_udpClientLock) { udpClient?.Connect(_endpoint, 6969); }
+                        // Pin the outbound socket to the responding server. Previously this
+                        // called Connect() in-place on the existing UdpClient, which rebinds
+                        // the underlying Socket and races concurrent SendAsync calls
+                        // mid-flight, producing intermittent SocketException InvalidArgument.
+                        // Full client swap via ConfigureUdp avoids the race — old client is
+                        // closed only after the new one is published.
+                        ConfigureUdp();
                         _isInitialized = true;
                         Debug.WriteLine($"[UDPHandler] Got Discovery Response for {_id}: {_endpoint}");
                         OnServerDiscovered?.Invoke(null, _endpoint);
@@ -374,32 +388,43 @@ namespace SlimeImuProtocol.SlimeVR
             }
         }
 
+        // Re-entry guard. Concurrent ConfigureUdp calls (watchdog re-handshake + receive-loop
+        // discovery landing simultaneously) used to create two UdpClients each lap; the loser
+        // leaked because oldClient under each lock arm captured the winner's fresh client.
+        private readonly object _configureLock = new object();
+
         public void ConfigureUdp()
         {
-            UdpClient oldClient;
-            UdpClient newClient = null;
-            lock (_udpClientLock)
+            lock (_configureLock)
             {
-                oldClient = udpClient;
-                udpClient = null; // readers take this as "no client available" until new one in place
-            }
-            try
-            {
-                _endpoint = Endpoint; // Cache the current static endpoint locally
-                newClient = new UdpClient();
-                newClient.Connect(_endpoint, 6969);
-                lock (_udpClientLock) { udpClient = newClient; }
-                Debug.WriteLine($"[UDPHandler] Configured UDP for {_id} -> {_endpoint}");
-            }
-            catch (Exception ex)
-            {
-                try { newClient?.Dispose(); } catch { }
-                Debug.WriteLine($"[UDPHandler] ConfigureUdp error for {_id}: {ex.Message}");
-            }
-            finally
-            {
-                try { oldClient?.Close(); } catch { }
-                try { oldClient?.Dispose(); } catch { }
+                UdpClient oldClient;
+                UdpClient newClient = null;
+                lock (_udpClientLock)
+                {
+                    oldClient = udpClient;
+                    udpClient = null; // readers take this as "no client available" until new one in place
+                }
+                try
+                {
+                    // If discovery hasn't resolved yet, fall back to the configured (broadcast
+                    // by default) endpoint. After handshake, _endpoint holds this handler's
+                    // own resolved server IP — independent of every other handler's choice.
+                    if (string.IsNullOrEmpty(_endpoint)) _endpoint = _configuredEndpoint;
+                    newClient = new UdpClient();
+                    newClient.Connect(_endpoint, 6969);
+                    lock (_udpClientLock) { udpClient = newClient; }
+                    Debug.WriteLine($"[UDPHandler] Configured UDP for {_id} -> {_endpoint}");
+                }
+                catch (Exception ex)
+                {
+                    try { newClient?.Dispose(); } catch { }
+                    Debug.WriteLine($"[UDPHandler] ConfigureUdp error for {_id}: {ex.Message}");
+                }
+                finally
+                {
+                    try { oldClient?.Close(); } catch { }
+                    try { oldClient?.Dispose(); } catch { }
+                }
             }
         }
 
