@@ -23,6 +23,10 @@ namespace SlimeImuProtocol.SlimeVR
         // 0 = idle, 1 = handshake in progress. Serialized via Interlocked.CompareExchange to
         // prevent two handlers from racing into simultaneous discovery.
         private static int _handshakeOngoingFlag = 0;
+        // Tracks whether THIS instance is currently the holder of the static handshake
+        // flag. Without this, Dispose() unconditionally cleared the flag — so a Dispose on
+        // any handler released the lock and let two handlers race into discovery again.
+        private bool _iOwnHandshakeFlag;
         public static event EventHandler OnForceHandshake;
         public static event EventHandler OnForceDestroy;
         public static event EventHandler<string> OnServerDiscovered;
@@ -177,11 +181,12 @@ namespace SlimeImuProtocol.SlimeVR
 
         private async Task WatchdogLoop(byte[] hardwareAddress, BoardType boardType, ImuType imuType, McuType mcuType, MagnetometerStatus magnetometerStatus, int supportedSensorCount)
         {
-            while (!disposed)
+            var token = _cts.Token;
+            while (!disposed && !token.IsCancellationRequested)
             {
                 if (!_active)
                 {
-                    await Task.Delay(1000);
+                    try { await Task.Delay(1000, token); } catch (OperationCanceledException) { return; }
                     continue;
                 }
 
@@ -193,6 +198,7 @@ namespace SlimeImuProtocol.SlimeVR
                     {
                         await Task.Delay(1000);
                     }
+                    _iOwnHandshakeFlag = true;
 
                     if (disposed) break;
 
@@ -218,7 +224,15 @@ namespace SlimeImuProtocol.SlimeVR
                     }
                     finally
                     {
-                        System.Threading.Interlocked.Exchange(ref _handshakeOngoingFlag, 0);
+                        // Only release the static flag if this instance is the holder. The
+                        // previous unconditional Exchange let any Dispose-during-handshake
+                        // clear the lock for whichever instance happened to be running, and
+                        // a second instance immediately raced in.
+                        if (_iOwnHandshakeFlag)
+                        {
+                            _iOwnHandshakeFlag = false;
+                            System.Threading.Interlocked.Exchange(ref _handshakeOngoingFlag, 0);
+                        }
                     }
 
                     if (_isInitialized)
@@ -276,18 +290,19 @@ namespace SlimeImuProtocol.SlimeVR
 
         private async Task ReceiveLoop(BoardType boardType, ImuType imuType, McuType mcuType, MagnetometerStatus magnetometerStatus, byte[] macAddress)
         {
-            while (!disposed)
+            var token = _cts.Token;
+            while (!disposed && !token.IsCancellationRequested)
             {
                 UdpClient client;
                 lock (_udpClientLock) { client = udpClient; }
                 if (client == null)
                 {
-                    await Task.Delay(100);
+                    try { await Task.Delay(100, token); } catch (OperationCanceledException) { return; }
                     continue;
                 }
                 try
                 {
-                    var result = await client.ReceiveAsync();
+                    var result = await client.ReceiveAsync(token);
                     _lastPacketReceivedTime = DateTimeOffset.UtcNow.ToUniversalTime().ToUnixTimeMilliseconds();
 
                     byte[] buffer = result.Buffer;
@@ -368,23 +383,26 @@ namespace SlimeImuProtocol.SlimeVR
                         }
                     }
                 }
+                catch (OperationCanceledException) { return; }
+                catch (ObjectDisposedException) { return; }
                 catch (Exception ex) when (!disposed)
                 {
                     Debug.WriteLine($"[UDPHandler] Receive Error: {ex.Message}");
-                    await Task.Delay(100);
+                    try { await Task.Delay(100, token); } catch (OperationCanceledException) { return; }
                 }
             }
         }
 
         private async Task HeartbeatLoop()
         {
-            while (!disposed)
+            var token = _cts.Token;
+            while (!disposed && !token.IsCancellationRequested)
             {
                 if (_active && _isInitialized)
                 {
                     await SendInternal(packetBuilder.CreateHeartBeat());
                 }
-                await Task.Delay(900);
+                try { await Task.Delay(900, token); } catch (OperationCanceledException) { return; }
             }
         }
 
@@ -610,14 +628,30 @@ namespace SlimeImuProtocol.SlimeVR
                 {
                     disposed = true;
                     _isInitialized = false;
-                    System.Threading.Interlocked.Exchange(ref _handshakeOngoingFlag, 0);
+                    // Cancel in-flight ReceiveAsync / SendAsync. Without _cts the loops kept
+                    // running on a disposed UdpClient until it threw ObjectDisposedException
+                    // and the catch swallowed it.
+                    try { _cts.Cancel(); } catch { }
+                    // Only release the global handshake flag if WE were holding it. The
+                    // previous unconditional release let one handler's Dispose unlock
+                    // discovery for everyone, racing two parallel handshakes.
+                    if (_iOwnHandshakeFlag)
+                    {
+                        _iOwnHandshakeFlag = false;
+                        System.Threading.Interlocked.Exchange(ref _handshakeOngoingFlag, 0);
+                    }
+                    // Unsubscribe from the static force-handshake/destroy events. Discovery-
+                    // only handlers used to leak their delegate into OnForceHandshake for the
+                    // lifetime of the process and continued receiving rehandshake calls.
+                    try { OnForceHandshake -= forceHandShakeDelegate; } catch { }
+                    try { OnForceDestroy -= UDPHandler_OnForceDestroy; } catch { }
                     UdpClient c;
                     lock (_udpClientLock) { c = udpClient; udpClient = null; }
                     try { c?.Close(); } catch { }
                     try { c?.Dispose(); } catch { }
                 }
             }
-            catch { }
+            catch (Exception ex) { Debug.WriteLine($"[UDPHandler] Dispose: {ex.Message}"); }
         }
 
         public void SendTrigger(float trigger, byte trackerId)
