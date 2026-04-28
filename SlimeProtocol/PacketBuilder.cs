@@ -199,6 +199,14 @@ namespace SlimeImuProtocol.SlimeVR
         public byte[] BuildHandshakePacket(BoardType boardType, ImuType imuType, McuType mcuType, MagnetometerStatus magStatus, byte[] mac)
         {
             var idBytes = System.Text.Encoding.UTF8.GetBytes(_identifierString);
+            // Identifier length field is u8 (one byte). Anything past 255 bytes used to be
+            // silently truncated by the (byte) cast on WriteByte(idBytes.Length), giving the
+            // server a length prefix that mismatched the actual payload — server then read
+            // garbage MAC bytes from the next field. Clip up front and document.
+            if (idBytes.Length > 255)
+            {
+                Array.Resize(ref idBytes, 255);
+            }
             int totalSize = 4 + 8 + 4 * 7 + 1 + idBytes.Length + mac.Length;
             var span = new byte[totalSize];
 
