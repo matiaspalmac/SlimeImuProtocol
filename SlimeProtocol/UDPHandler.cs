@@ -206,6 +206,15 @@ namespace SlimeImuProtocol.SlimeVR
                     {
                         Debug.WriteLine($"[UDPHandler] Starting Handshake for {_id}...");
 
+                        // Exponential backoff for the handshake loop. Old code blasted the
+                        // configured endpoint with a packet every 1s indefinitely — when the
+                        // server is offline or the network is partitioned that floods syslog,
+                        // wakes power-saving NICs, and (on broadcast targets) bothers every
+                        // peer on the LAN. Start at 500ms, double up to 30s, and never give
+                        // up — the server might come online later.
+                        const int handshakeBackoffStartMs = 500;
+                        const int handshakeBackoffCapMs = 30_000;
+                        int handshakeBackoffMs = handshakeBackoffStartMs;
                         while (!_isInitialized && _active && !disposed)
                         {
                             // Check if endpoint changed during handshake attempt
@@ -215,7 +224,8 @@ namespace SlimeImuProtocol.SlimeVR
                             }
 
                             await SendInternal(packetBuilder.BuildHandshakePacket(boardType, imuType, mcuType, magnetometerStatus, hardwareAddress));
-                            await Task.Delay(1000);
+                            await Task.Delay(handshakeBackoffMs);
+                            handshakeBackoffMs = Math.Min(handshakeBackoffMs * 2, handshakeBackoffCapMs);
                         }
                     }
                     catch (Exception ex)
