@@ -11,6 +11,15 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Test sources live next to the library so the submodule is self-contained. The
+         default Compile glob would otherwise pull them into this project and fail because
+         xUnit references are only on the test project. -->
+    <Compile Remove="SlimeImuProtocol.Tests\**" />
+    <None Remove="SlimeImuProtocol.Tests\**" />
+    <EmbeddedResource Remove="SlimeImuProtocol.Tests\**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="LucHeart.CoreOSC" Version="1.5.1" />
   </ItemGroup>
 
