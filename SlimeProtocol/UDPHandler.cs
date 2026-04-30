@@ -51,6 +51,15 @@ namespace SlimeImuProtocol.SlimeVR
 
         private long _lastPacketReceivedTime = DateTimeOffset.UtcNow.ToUniversalTime().ToUnixTimeMilliseconds();
         private bool _isInitialized = false;
+        // Two-step discovery: first reply lands on the broadcast UdpClient (source port X);
+        // we then swap to a unicast UdpClient (source port Y) targeted at the resolved server
+        // IP. Server tracks tracker identity by (clientIp, sourcePort), so SENSOR_INFO/
+        // heartbeat/rotation from port Y without a prior HANDSHAKE on port Y get silently
+        // dropped — the tracker never appears in the dashboard. After the swap we resend
+        // HANDSHAKE on port Y; the server's reply re-enters this branch with _endpointPinned
+        // already set, and only then do we mark the handler initialized. Reset on every
+        // explicit re-handshake (Rehandshake / watchdog timeout already drop _isInitialized).
+        private bool _endpointPinned = false;
         private CancellationTokenSource _cts = new CancellationTokenSource();
         public bool IsDiscoveryOnly { get; set; } = false;
 
@@ -160,6 +169,10 @@ namespace SlimeImuProtocol.SlimeVR
         private void TriggerHandshake()
         {
             _isInitialized = false;
+            // Drop the pin so an explicit re-handshake re-runs the swap-and-resend dance
+            // against whatever server replies first — the old server may have moved or
+            // the user may have changed Endpoint while we were idle.
+            _endpointPinned = false;
         }
 
         private void UDPHandler_OnForceDestroy(object? sender, EventArgs e)
@@ -332,14 +345,32 @@ namespace SlimeImuProtocol.SlimeVR
 
                     if (looksLikeHandshakeAscii && !_isInitialized)
                     {
-                        _endpoint = result.RemoteEndPoint.Address.ToString();
-                        // Pin the outbound socket to the responding server. Previously this
-                        // called Connect() in-place on the existing UdpClient, which rebinds
-                        // the underlying Socket and races concurrent SendAsync calls
-                        // mid-flight, producing intermittent SocketException InvalidArgument.
-                        // Full client swap via ConfigureUdp avoids the race — old client is
-                        // closed only after the new one is published.
-                        ConfigureUdp();
+                        string serverIp = result.RemoteEndPoint.Address.ToString();
+                        if (!_endpointPinned)
+                        {
+                            // Swap from the broadcast UdpClient to a unicast one targeted at
+                            // the responding server. Connect() in-place would have raced
+                            // concurrent SendAsync (rebinds the underlying socket), so we use
+                            // a full client swap via ConfigureUdp — old client is closed only
+                            // after the new one is published. The new socket has a fresh
+                            // ephemeral source port; the server keys tracker identity on
+                            // (clientIp, sourcePort), so we MUST re-send HANDSHAKE on the new
+                            // socket before sending SENSOR_INFO. Skipping that step (the
+                            // regression introduced in 8a17d02) left the server with a stale
+                            // registration on the old port and ignored everything that came
+                            // from the new port — tracker never appeared in the dashboard.
+                            _endpoint = serverIp;
+                            ConfigureUdp();
+                            _endpointPinned = true;
+                            await SendInternal(packetBuilder.BuildHandshakePacket(
+                                boardType, imuType, mcuType, magnetometerStatus, macAddress));
+                            Debug.WriteLine($"[UDPHandler] Pinned to server {_endpoint} for {_id}; re-handshaking on swapped socket");
+                            continue;
+                        }
+                        // Second reply — this one arrived on the unicast socket, so the
+                        // server has registered the (clientIp, sourcePort) for the new
+                        // socket. Safe to mark initialized.
+                        _endpoint = serverIp;
                         _isInitialized = true;
                         Debug.WriteLine($"[UDPHandler] Got Discovery Response for {_id}: {_endpoint}");
                         OnServerDiscovered?.Invoke(null, _endpoint);
